@@ -1,0 +1,18 @@
+# TD/仿真临时产物
+*.db
+*.area
+*.ts
+*.bid
+*.timing
+*.qor
+*.lock.f
+.*.f
+billboard_Runs/
+hdmi_test_Runs/
+sim/ivl_tmp/
+sim/ivlogs/
+sim/work/
+container.bin
+*.logw
+build_logs/
+log/

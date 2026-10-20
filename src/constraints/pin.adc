@@ -1,0 +1,54 @@
+#============================================================================
+# pin_ac201.adc —— AC201-EG4S20 评估板引脚约束（最终版）
+#----------------------------------------------------------------------------
+# 来源（2026-10-18 核实）：
+#   ① fpga.cn 帖子 30478 官方《AC201-EG4S20管脚信息表.xlsx》
+#   ② 官方例程 AC201_AL_board_test 的 IO.adc（IOSTANDARD / PULLTYPE 照抄）
+# 时钟：板载 CLK_50MHz = K14，与主工程 50MHz 相同 → 两个 PLL 零改动。
+#
+# 与 HX4S20C 版 pin.adc 的差异：
+#   - 全部引脚号重排（同一颗 EG4S20BG256，不同底板）
+#   - 数码管 14 根直驱 → 3 根 595 串行（DIO=R14 / SCLK=T14 / RCLK=R12）
+#   - 无 HDMI DDC（AC201 底板未接，官方 IO.adc 亦无）
+#   - TMDS 差分对正端用 LVDS33_E（官方 IO.adc 原文；HX4S20C 版是 LVDS33）
+#   - 按键/拨码均带 PULLUP（板上无外部上拉的脚由 FPGA 内部上拉兜底）
+#   - led 低电平点亮（极性在 RTL 里取反，约束层面无感）
+#============================================================================
+
+#------------------------- 时钟与复位 ------------------------
+# 板载 50MHz 晶振（官方 IO.adc：clk = K14, LVCMOS33, PULLUP）
+set_pin_assignment	{ clk }	{ LOCATION = K14; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+# 复位 = KEY2（H14），按下 = 0；官方例程同样把 H14 用作 rst_n
+set_pin_assignment	{ rst_n }	{ LOCATION = H14; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+
+#------------------------- 按键与拨码 ------------------------
+set_pin_assignment	{ key1 }	{ LOCATION = F7; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+set_pin_assignment	{ key2 }	{ LOCATION = E7; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+set_pin_assignment	{ sw[0] }	{ LOCATION = N14; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+set_pin_assignment	{ sw[1] }	{ LOCATION = K12; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+
+#------------------------- 指示灯 ----------------------------
+# LED0~LED3 = M12/R16/R15/T15；板上低电平点亮（RTL 已取反）
+set_pin_assignment	{ led[0] }	{ LOCATION = M12; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led[1] }	{ LOCATION = R16; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led[2] }	{ LOCATION = R15; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ led[3] }	{ LOCATION = T15; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+
+#------------------------- 数码管（3 线 595 串行）------------
+set_pin_assignment	{ seg_ser }	{ LOCATION = R14; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ seg_sclk }	{ LOCATION = T14; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ seg_rclk }	{ LOCATION = R12; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+
+#------------------------- HDMI 输出（TMDS 差分对正端）--------
+# 官方 IO.adc：O_tmds_clk_p=B10 / ch0_p=D11 / ch1_p=C11 / ch2_p=F10，LVDS33_E
+# 差分负端由 TD 按对自动推导，不单独约束
+set_pin_assignment	{ HDMI_CLK_P }	{ LOCATION = B10; IOSTANDARD = LVDS33_E; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ HDMI_D0_P }	{ LOCATION = D11; IOSTANDARD = LVDS33_E; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ HDMI_D1_P }	{ LOCATION = C11; IOSTANDARD = LVDS33_E; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ HDMI_D2_P }	{ LOCATION = F10; IOSTANDARD = LVDS33_E; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+
+#------------------------- TF 卡（SPI 模式）------------------
+set_pin_assignment	{ sd_ncs }	{ LOCATION = R2; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }
+set_pin_assignment	{ sd_dclk }	{ LOCATION = M2; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ sd_mosi }	{ LOCATION = L3; IOSTANDARD = LVCMOS33; DRIVESTRENGTH = 8; PULLTYPE = NONE; }
+set_pin_assignment	{ sd_miso }	{ LOCATION = K6; IOSTANDARD = LVCMOS33; PULLTYPE = PULLUP; }

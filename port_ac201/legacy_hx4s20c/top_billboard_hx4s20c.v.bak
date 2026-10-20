@@ -1,0 +1,718 @@
+//============================================================================
+// top_billboard.v  ——  顶层整合（把前面所有模块接起来）
+//---------------------------------------------------------------------------
+// 【这一层要做的事，按顺序看】
+//   1. 生成所有时钟和复位
+//        50MHz 输入 ─┬─ sys_pll   → 100MHz 读 SD 卡 / 125MHz SDRAM / 125MHz(移相)
+//                    ├─ video_pll → 75MHz 像素时钟 / 375MHz HDMI 串行时钟
+//                    └─ PLL_HDMI_AUDIO → 12.288MHz 音频主时钟
+//   【分辨率】1280x720@60，时序参数在 support/color_bar.v 的 `VIDEO_1280_720 分支
+//   2. 4 个按键消抖（在 100MHz 域做，20ms 消抖很准）
+//   3. 数据链路：
+//        TF 卡 ──spi── sd_card_top ──扇区数据── ebm_reader ──像素──┐
+//                                                                  ├─ frame_read_write ─ SDRAM
+//        play_scheduler ──调度────────────── 控制谁写哪块、显示哪块 ┘
+//   4. 显示链路：
+//        SDRAM ─frame_read_write─→ video_delay ─→ osd_mixer(亮度+字幕) ─→
+//        video_rgb_to_axis ─→ HDMI 1.4b 发射核 ─→ hdmi_phy ─→ HDMI 口
+//   5. 音频链路：
+//        audio_player(PCM素材) ─→ audio_arc_calculate(算 ACR) ─→ HDMI 核
+//   6. 人机界面：数码管显示状态，LED 显示灯语
+//
+// 【跨时钟域握手一览】—— 到处都要跨域，所以集中写在这一层
+//   (a) 视频每帧脉冲   video(75M) → sd(100M)      ：翻转信号 + 打三拍做边沿检测
+//   (b) 换帧请求 req   sd(100M) → video(25M)      ：电平，打两拍
+//   (c) 换帧回应 ack   video(75M) → sd(100M)      ：单拍脉冲只有 13.3ns，比 sd 周期
+//                                                   10ns 只快 1.33 倍，所以顶层先把脉冲
+//                                                   展宽到 3 拍(40ns) 再交给 sd 域做边沿检测
+//   (d) SDRAM 写完     mem(125M) → sd(100M)       ：翻转信号 + 边沿检测
+//   (e) 音频段号       sd(100M) → mclk(12.288M)   ：4bit 打两拍
+//   (f) disp_buf_idx   sd(100M) → mem/video       ：多位，但只在全黑时改一次，
+//============================================================================
+`timescale 1ns / 1ps
+
+module top_billboard (
+    input  wire        clk,            // 板载 50MHz
+    input  wire        rst_n,          // 按键复位，低有效
+
+    input  wire        key1,           // 手动下一张
+    input  wire        key2,           // 自动轮播 开/关
+    input  wire        key3,           // 轮播周期 2/5/10/20 秒
+    input  wire        key4,           // 应急画面 开/关
+
+    output wire [3:0]  led,            // 4 只指示灯
+
+    output wire [5:0]  seg_sel,        // 数码管位选
+    output wire [7:0]  seg_data,       // 数码管段选
+
+    // HDMI TMDS
+    output wire        HDMI_CLK_P,
+    output wire        HDMI_D2_P,
+    output wire        HDMI_D1_P,
+    output wire        HDMI_D0_P,
+
+    // HDMI DDC（读显示器 EDID）
+    output wire        HDMI_DDC_SCL,
+    inout  wire        HDMI_DDC_SDA,
+
+    // TF 卡（SPI 模式）
+    output wire        sd_ncs,
+    output wire        sd_dclk,
+    output wire        sd_mosi,
+    input  wire        sd_miso
+);
+
+    //=========================================================== 常量
+    localparam MEM_DATA_BITS = 32;
+    localparam ADDR_BITS     = 21;
+    // 1 像素 = SDRAM 里 1 个 32bit 字（视频读回时取 [31:8] 当 RGB）
+    localparam FRAME_PIXELS  = 24'd921600;      // 1280*720
+    localparam BUF0_ADDR     = 24'd0;
+    localparam BUF1_ADDR     = FRAME_PIXELS;    // 双缓冲共占 1,843,200 字
+                                                // ADDR_BITS=21 -> 2,097,152 字，够放
+
+    //=========================================================== 时钟与复位
+    wire sys_pll_lock;
+    wire video_pll_lock;
+    wire audio_pll_lock;
+
+    wire sd_card_clk;        // 100MHz  SD 卡 / 调度器 / 数码管扫描
+    wire ext_mem_clk;        // 125MHz  SDRAM
+    wire ext_mem_clk_sft;    // 125MHz  移相，SDRAM 芯片需要
+    wire video_clk;          // 75MHz   像素时钟
+    wire hdmi_5x_clk;        // 375MHz  HDMI 串行时钟（像素时钟 ×5）
+    wire audio_mclk;         // 12.288MHz 音频主时钟
+
+    wire rst_all;
+
+    sys_pll u_sys_pll (
+        .refclk   (clk),
+        .reset    (1'b0),
+        .extlock  (sys_pll_lock),
+        .clk0_out (sd_card_clk),
+        .clk1_out (ext_mem_clk),
+        .clk2_out (ext_mem_clk_sft)
+    );
+
+    video_pll u_video_pll (
+        .refclk   (clk),
+        .reset    (1'b0),
+        .extlock  (video_pll_lock),
+        .clk0_out (video_clk),
+        .clk1_out (hdmi_5x_clk)
+    );
+
+    PLL_HDMI_AUDIO u_audio_pll (
+        .refclk   (clk),
+        .reset    (1'b0),
+        .extlock  (audio_pll_lock),
+        .clk0_out (),
+        .clk1_out (),
+        .clk2_out (audio_mclk)
+    );
+
+    // 等三个 PLL 锁定并稳定 20ms 才放复位，避免上电瞬间乱跑；
+    // 复位一旦放开就锁住，不再因为 PLL 抖动反复复位。
+    // 【2026-10-12 加固】若 40ms 内 PLL 迟迟不齐，超时强行放行：
+    //   宁可视频/音频带病运行，也要保证 LED 心跳和数码管能报告状态——
+    //   否则一个 PLL 不锁就把整板"闷死"，上板时无从判断是没配置还是 PLL 问题。
+    reg [20:0] rst_cnt;
+    reg        rst_wait;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            rst_cnt  <= 21'd0;
+            rst_wait <= 1'b1;
+        end else if (!rst_wait) begin
+            rst_wait <= 1'b0;
+        end else if (sys_pll_lock && video_pll_lock && audio_pll_lock) begin
+            if (rst_cnt < 21'd1_000_000) begin
+                rst_cnt  <= rst_cnt + 21'd1;
+                rst_wait <= 1'b1;
+            end else begin
+                rst_wait <= 1'b0;              // 锁定后稳 20ms，正常放行
+            end
+        end else if (rst_cnt < 21'd2_000_000) begin
+            rst_cnt  <= rst_cnt + 21'd1;       // PLL 未齐：继续等，最多 40ms
+        end else begin
+            rst_wait <= 1'b0;                  // 超时兜底：强行放行
+        end
+    end
+
+    assign rst_all = rst_wait;
+
+    //=========================================================== 按键消抖
+    wire [3:0] key_press;   // 按下瞬间 1 拍
+    wire [3:0] key_down;    // 按住时 1
+
+    key_debounce #(
+        .CLK_FREQ_HZ (100_000_000),
+        .DEBOUNCE_MS (20),
+        .KEY_NUM     (4)
+    ) u_key_debounce (
+        .clk         (sd_card_clk),
+        .rst         (rst_all),
+        .key_in      ({key4, key3, key2, key1}),   // 按下 = 0
+        .press_pulse (key_press),
+        .key_down    (key_down)
+    );
+
+    //=========================================================== SD 卡底层
+    wire        sd_init_done;
+    wire        sd_sec_read;
+    wire [31:0] sd_sec_read_addr;
+    wire [7:0]  sd_sec_read_data;
+    wire        sd_sec_read_data_valid;
+    wire        sd_sec_read_end;
+
+    sd_card_top u_sd_card_top (
+        .clk                    (sd_card_clk),
+        .rst                    (rst_all),
+        .SD_nCS                 (sd_ncs),
+        .SD_DCLK                (sd_dclk),
+        .SD_MOSI                (sd_mosi),
+        .SD_MISO                (sd_miso),
+        .sd_init_done           (sd_init_done),
+        .sd_sec_read            (sd_sec_read),
+        .sd_sec_read_addr       (sd_sec_read_addr),
+        .sd_sec_read_data       (sd_sec_read_data),
+        .sd_sec_read_data_valid (sd_sec_read_data_valid),
+        .sd_sec_read_end        (sd_sec_read_end),
+        .sd_sec_write           (1'b0),
+        .sd_sec_write_addr      (32'd0),
+        .sd_sec_write_data      (8'd0),
+        .sd_sec_write_data_req  (),
+        .sd_sec_write_end       ()
+    );
+
+    //=========================================================== 私有容器解析
+    wire        idx_start;
+    wire        index_ready;
+    wire [15:0] img_count;
+    wire [15:0] err_code;
+    wire [3:0]  ebm_state;
+
+    wire        load_start;
+    wire [3:0]  load_id;
+    wire        load_done;
+    wire        load_error;
+
+    wire        sd_card_write_en;
+    wire [31:0] sd_card_write_data;
+    wire        sd_card_write_req;
+    wire        sd_card_write_req_ack;
+
+    ebm_reader #(
+        .CONTAINER_LBA (32'd1048576),     // 512MiB 偏移，见 gen_container.py 的 --lba
+        .MAX_IMG       (8),
+        .PIX_BYTES     (32'd2764800),     // 1280*720*3
+        .TIMEOUT_CYC   (8_000_000)        // 80ms @100MHz
+    ) u_ebm_reader (
+        .clk                    (sd_card_clk),
+        .rst                    (rst_all),
+        .sd_init_done           (sd_init_done),
+
+        .start                  (idx_start),
+        .index_ready            (index_ready),
+        .img_count              (img_count),
+        .err_code               (err_code),
+        .state_code             (ebm_state),
+        .busy                   (),
+
+        .load_start             (load_start),
+        .load_id                (load_id),
+        .load_busy              (),
+        .load_done              (load_done),
+        .load_error             (load_error),
+
+        .write_req              (sd_card_write_req),
+        .write_req_ack          (sd_card_write_req_ack),
+        .write_en               (sd_card_write_en),
+        .write_data             (sd_card_write_data),
+
+        .sd_sec_read            (sd_sec_read),
+        .sd_sec_read_addr       (sd_sec_read_addr),
+        .sd_sec_read_data       (sd_sec_read_data),
+        .sd_sec_read_data_valid (sd_sec_read_data_valid),
+        .sd_sec_read_end        (sd_sec_read_end)
+    );
+
+    //=========================================================== 跨域信号准备
+    // ---- (a) 视频帧脉冲：video 域 → sd 域 ----
+    wire hs_0, vs_0, de_0;
+    reg  vs_0_d;
+    reg  frame_tick_vid;
+    reg  frame_tgl_vid;
+
+    always @(posedge video_clk or posedge rst_all) begin
+        if (rst_all) begin
+            vs_0_d         <= 1'b0;
+            frame_tick_vid <= 1'b0;
+            frame_tgl_vid  <= 1'b0;
+        end else begin
+            vs_0_d         <= vs_0;
+            frame_tick_vid <= vs_0 & ~vs_0_d;
+            if (vs_0 & ~vs_0_d)
+                frame_tgl_vid <= ~frame_tgl_vid;
+        end
+    end
+
+    reg [2:0] ftg_sync;
+    always @(posedge sd_card_clk or posedge rst_all) begin
+        if (rst_all) ftg_sync <= 3'b000;
+        else         ftg_sync <= {ftg_sync[1:0], frame_tgl_vid};
+    end
+    wire frame_tick_sd = ftg_sync[2] ^ ftg_sync[1];
+
+    // ---- (d) SDRAM 帧写完成：mem 域 → sd 域 ----
+    wire frame_write_finish;
+    reg  frame_write_tgl_mem;
+
+    always @(posedge ext_mem_clk or posedge rst_all) begin
+        if (rst_all)                      frame_write_tgl_mem <= 1'b0;
+        else if (frame_write_finish)      frame_write_tgl_mem <= ~frame_write_tgl_mem;
+    end
+
+    reg [2:0] wfin_sync;
+    always @(posedge sd_card_clk or posedge rst_all) begin
+        if (rst_all) wfin_sync <= 3'b000;
+        else         wfin_sync <= {wfin_sync[1:0], frame_write_tgl_mem};
+    end
+    wire write_done_sd = wfin_sync[2] ^ wfin_sync[1];
+
+    //=========================================================== 调度器
+    wire        req_switch;
+    wire        ack_switch_sd;
+    wire [1:0]  write_buf_idx;
+    wire [1:0]  disp_buf_idx;
+    wire [3:0]  audio_seg;
+    wire        audio_seg_tgl;
+    wire [3:0]  sched_state;
+    wire [3:0]  cur_id;
+    wire [3:0]  normal_id;
+    wire        auto_en;
+    wire        emerg_en;
+    wire [1:0]  dwell_sel;
+    wire [15:0] last_err;
+
+    play_scheduler #(
+        .EMERG_ID (4'd0),
+        .BOOT_DLY (50_000_000),
+        .IMG_MAX  (8)
+    ) u_play_scheduler (
+        .clk            (sd_card_clk),
+        .rst            (rst_all),
+        .sd_init_done   (sd_init_done),
+        .frame_tick     (frame_tick_sd),
+
+        .key_press      (key_press),
+
+        .idx_start      (idx_start),
+        .index_ready    (index_ready),
+        .img_count      (img_count),
+        .err_code       (err_code),
+
+        .load_start     (load_start),
+        .load_id        (load_id),
+        .load_busy      (1'b0),
+        .load_done      (load_done),
+        .write_done     (write_done_sd),
+        .load_error     (load_error),
+
+        .write_buf_idx  (write_buf_idx),
+        .disp_buf_idx   (disp_buf_idx),
+
+        .req_switch     (req_switch),
+        .ack_switch     (ack_switch_sd),
+
+        .audio_seg      (audio_seg),
+        .audio_seg_tgl  (audio_seg_tgl),
+
+        .state_code     (sched_state),
+        .cur_id         (cur_id),
+        .normal_id      (normal_id),
+        .auto_en        (auto_en),
+        .emerg_en       (emerg_en),
+        .dwell_sel      (dwell_sel),
+        .last_err       (last_err)
+    );
+
+    //=========================================================== 视频时序 + 帧缓存
+    wire        video_read_req;
+    wire        video_read_req_ack;
+    wire        video_read_en;
+    wire [31:0] video_read_data;
+
+    wire App_rd_en;
+    wire [ADDR_BITS-1:0]     App_rd_addr;
+    wire                     Sdr_rd_en;
+    wire [MEM_DATA_BITS-1:0] Sdr_rd_dout;
+    wire                     App_wr_en;
+    wire [ADDR_BITS-1:0]     App_wr_addr;
+    wire [MEM_DATA_BITS-1:0] App_wr_din;
+    wire [3:0]               App_wr_dm;
+
+    wire Sdr_init_done;
+    wire Sdr_init_ref_vld;
+    wire Sdr_busy;
+
+    wire [23:0] vout_data_raw;   // 从 SDRAM 出来的原始画面
+    wire [23:0] vout_data;       // 叠了字幕、调了亮度之后的画面
+    wire        hs, vs, de;      // 与 vout_data_raw 对齐
+    wire        hs_m, vs_m, de_m;// 与 vout_data 对齐（混合器延迟 1 拍）
+
+    video_timing_data u_video_timing_data (
+        .video_clk    (video_clk),
+        .rst          (rst_all),
+        .read_req     (video_read_req),
+        .read_req_ack (video_read_req_ack),
+        .hs           (hs_0),
+        .vs           (vs_0),
+        .de           (de_0)
+    );
+
+    video_delay u_video_delay (
+        .video_clk (video_clk),
+        .rst       (rst_all),
+        .read_en   (video_read_en),
+        .read_data (video_read_data[31:8]),
+        .hs        (hs_0),
+        .vs        (vs_0),
+        .de        (de_0),
+        .hs_r      (hs),
+        .vs_r      (vs),
+        .de_r      (de),
+        .vout_data (vout_data_raw)
+    );
+
+    frame_read_write #(
+        .WRITE_V_FLIP (1),            // BMP 行是自下而上的，写的时候翻正
+        .FRAME_WIDTH  (1280),
+        .FRAME_HEIGHT (720)
+    ) u_frame_read_write (
+        .mem_clk          (ext_mem_clk),
+        .rst              (rst_all),
+        .Sdr_init_done    (Sdr_init_done),
+        .Sdr_init_ref_vld (Sdr_init_ref_vld),
+        .Sdr_busy         (Sdr_busy),
+
+        .App_rd_en        (App_rd_en),
+        .App_rd_addr      (App_rd_addr),
+        .Sdr_rd_en        (Sdr_rd_en),
+        .Sdr_rd_dout      (Sdr_rd_dout),
+
+        .read_clk         (video_clk),
+        .read_req         (video_read_req),
+        .read_req_ack     (video_read_req_ack),
+        .read_finish      (),
+        .read_addr_0      (BUF0_ADDR[ADDR_BITS-1:0]),
+        .read_addr_1      (BUF1_ADDR[ADDR_BITS-1:0]),
+        .read_addr_2      ({ADDR_BITS{1'b0}}),
+        .read_addr_3      ({ADDR_BITS{1'b0}}),
+        .read_addr_index  (disp_buf_idx),
+        .read_len         (FRAME_PIXELS[ADDR_BITS-1:0]),
+        .read_en          (video_read_en),
+        .read_data        (video_read_data),
+
+        .App_wr_en        (App_wr_en),
+        .App_wr_addr      (App_wr_addr),
+        .App_wr_din       (App_wr_din),
+        .App_wr_dm        (App_wr_dm),
+
+        .write_clk        (sd_card_clk),
+        .write_req        (sd_card_write_req),
+        .write_req_ack    (sd_card_write_req_ack),
+        .write_finish     (frame_write_finish),
+        .write_addr_0     (BUF0_ADDR[ADDR_BITS-1:0]),
+        .write_addr_1     (BUF1_ADDR[ADDR_BITS-1:0]),
+        .write_addr_2     ({ADDR_BITS{1'b0}}),
+        .write_addr_3     ({ADDR_BITS{1'b0}}),
+        .write_addr_index (write_buf_idx),
+        .write_len        (FRAME_PIXELS[ADDR_BITS-1:0]),
+        .write_en         (sd_card_write_en),
+        .write_data       (sd_card_write_data)
+    );
+
+    sdram u_sdram (
+        .Clk              (ext_mem_clk),
+        .Clk_sft          (ext_mem_clk_sft),
+        .Rst              (rst_all),
+        .Sdr_init_done    (Sdr_init_done),
+        .Sdr_init_ref_vld (Sdr_init_ref_vld),
+        .Sdr_busy         (Sdr_busy),
+        .App_wr_en        (App_wr_en),
+        .App_wr_addr      (App_wr_addr),
+        .App_wr_dm        (App_wr_dm),
+        .App_wr_din       (App_wr_din),
+        .App_rd_en        (App_rd_en),
+        .App_rd_addr      (App_rd_addr),
+        .Sdr_rd_en        (Sdr_rd_en),
+        .Sdr_rd_dout      (Sdr_rd_dout)
+    );
+
+    //=========================================================== 换帧握手（sd ↔ video）
+    // ---- (b) req：sd 域 → video 域 ----
+    reg [1:0] req_sync_v;
+    always @(posedge video_clk or posedge rst_all) begin
+        if (rst_all) req_sync_v <= 2'b00;
+        else         req_sync_v <= {req_sync_v[0], req_switch};
+    end
+    wire tr_req = req_sync_v[1];
+
+    // ---- 转场控制器（video 域） ----
+    wire [8:0] blend;
+    wire [2:0] tr_phase;
+    wire       tr_ack;
+
+    transition_ctrl u_transition_ctrl (
+        .clk        (video_clk),
+        .rst        (rst_all),
+        .frame_tick (frame_tick_vid),
+        .req        (tr_req),
+        .ack        (tr_ack),
+        .blend      (blend),
+        .phase      (tr_phase)
+    );
+
+    // ---- (c) ack：video 域 → sd 域 ----
+    // 75MHz(13.3ns) 相对 100MHz(10ns) 只快 1.33 倍，单拍 ack 有被漏采的风险，
+    // 所以先在 video 域把 ack 展宽到 3 拍（40ns > 2×10ns），再交 sd 域做边沿检测。
+    reg [1:0] ack_wide;
+    always @(posedge video_clk or posedge rst_all) begin
+        if (rst_all)                ack_wide <= 2'b00;
+        else if (tr_ack)            ack_wide <= 2'b11;
+        else if (ack_wide != 2'b00) ack_wide <= ack_wide - 2'd1;
+    end
+    wire tr_ack_wide = (ack_wide != 2'b00);
+
+    reg [2:0] ack_sync_s;
+    always @(posedge sd_card_clk or posedge rst_all) begin
+        if (rst_all) ack_sync_s <= 3'b000;
+        else         ack_sync_s <= {ack_sync_s[1:0], tr_ack_wide};
+    end
+    assign ack_switch_sd = ack_sync_s[2] & ~ack_sync_s[1];
+
+    //=========================================================== 字幕滚动偏移
+    reg [10:0] osd_ofs;
+    always @(posedge video_clk or posedge rst_all) begin
+        if (rst_all)                 osd_ofs <= 11'd0;
+        else if (frame_tick_vid)     osd_ofs <= osd_ofs + 11'd2;   // 每帧右移 2 像素
+    end
+
+    //=========================================================== 混合 + 字幕
+    osd_mixer #(
+        .SCREEN_W (1280),
+        .SCREEN_H (720),
+        .OSD_H    (32),
+        .FG_COLOR (24'hFFD24A),
+        .BG_COLOR (24'h101828)
+    ) u_osd_mixer (
+        .clk      (video_clk),
+        .rst      (rst_all),
+        .rgb_in   (vout_data_raw),
+        .de_in    (de),
+        .vs_in    (vs),
+        .blend    (blend),
+        .osd_on   (1'b1),      // 想关掉字幕条就把它改成 1'b0
+        .osd_ofs  (osd_ofs),
+        .rgb_out  (vout_data),
+        .de_out   (de_m),
+        .vs_out   (vs_m)
+    );
+
+    //=========================================================== 音频
+    // ---- (e) 音效段号：sd 域 → mclk 域 ----
+    reg [3:0] seg_m0, seg_m1;
+    always @(posedge audio_mclk or posedge rst_all) begin
+        if (rst_all) begin
+            seg_m0 <= 4'd0;
+            seg_m1 <= 4'd0;
+        end else begin
+            seg_m0 <= audio_seg;
+            seg_m1 <= seg_m0;
+        end
+    end
+
+    wire        audio_valid;
+    wire [23:0] audio_left_data;
+    wire [23:0] audio_right_data;
+    wire        acr_valid;
+    wire [19:0] acr_cts;
+    wire [19:0] acr_n;
+
+    audio_player #(
+        .MCLK_HZ   (12_288_000),
+        .SAMPLE_HZ (48_000),
+        .ROM_DEPTH (8192),
+        .SEG_NUM   (4),
+        .OFS_W     (13),
+        .ADDR_W    (15)
+    ) u_audio_player (
+        .mclk           (audio_mclk),
+        .rst_mclk       (rst_all),
+        .seg_id         (seg_m1),
+        .vid_clk        (video_clk),
+        .rst_vid        (rst_all),
+        .o_audio_valid  (audio_valid),
+        .o_left         (audio_left_data),
+        .o_right        (audio_right_data)
+    );
+
+    audio_arc_calculate #(
+        .ACR_N (6144)
+    ) u_audio_arc_calculate (
+        .I_clk         (video_clk),
+        .I_rst         (rst_all),
+        .I_audio_valid (audio_valid),
+        .O_acr_valid   (acr_valid),
+        .O_acr_cts     (acr_cts),
+        .O_acr_n       (acr_n)
+    );
+
+    //=========================================================== RGB/DE → AXIS
+    wire        axis_s_user;
+    wire        axis_s_valid;
+    wire        axis_s_last;
+    wire [23:0] axis_s_data;
+    wire        axis_s_ready;
+
+    video_rgb_to_axis_640x480 u_video_rgb_to_axis (
+        .I_clk        (video_clk),
+        .I_rst        (rst_all),
+        .I_vs         (vs_m),
+        .I_de         (de_m),
+        .I_rgb        (vout_data),
+        .O_video_user (axis_s_user),
+        .O_video_valid(axis_s_valid),
+        .O_video_last (axis_s_last),
+        .O_video_data (axis_s_data)
+    );
+
+    //=========================================================== HDMI 发射
+    wire        edid_trig;
+    wire        edid_valid;
+    wire [7:0]  edid_data;
+
+    wire [9:0]  tmds_ch0_data;
+    wire [9:0]  tmds_ch1_data;
+    wire [9:0]  tmds_ch2_data;
+    wire [9:0]  tmds_clk_data;
+
+    startup_pulse #(
+        .CNT_MAX (20'd100000)
+    ) u_startup_pulse (
+        .I_clk   (video_clk),
+        .I_rst   (rst_all),
+        .O_pulse (edid_trig)
+    );
+
+    hdmi_1_4b_transmitter_core_wrapper #(
+        .DEVICE            ("EG"),
+        .HTOTAL            (1650),
+        .HSA               (40),
+        .HFP               (110),
+        .HBP               (220),
+        .HACTIVE           (1280),
+        .VTOTAL            (750),
+        .VSA               (5),
+        .VFP               (5),
+        .VBP               (20),
+        .VACTIVE           (720),
+        .VIDEO_VIC         (4),
+        .VIDEO_TPG         ("Disable"),
+        .VIDEO_FORMAT      ("RGB"),
+        .AUDIO_SAMPLE_RATE ("48K"),
+        .IIC_SCL_DIV       (250)
+    ) u_hdmi_core (
+        .I_pixel_clk        (video_clk),
+        .I_rst              (rst_all),
+        .I_edid_read_trig   (edid_trig),
+        .O_edid_read_valid  (edid_valid),
+        .O_edid_read_data   (edid_data),
+
+        .I_axis_s_user      (axis_s_user),
+        .I_axis_s_valid     (axis_s_valid),
+        .I_axis_s_last      (axis_s_last),
+        .I_axis_s_data      (axis_s_data),
+        .O_axis_s_ready     (axis_s_ready),
+
+        .I_audio_valid      (audio_valid),
+        .I_audio_left_data  (audio_left_data),
+        .I_audio_right_data (audio_right_data),
+        .I_acr_valid        (acr_valid),
+        .I_acr_cts          (acr_cts),
+        .I_acr_n            (acr_n),
+
+        .O_video_locked     (),
+        .O_ddc_scl          (HDMI_DDC_SCL),
+        .IO_ddc_sda         (HDMI_DDC_SDA),
+
+        .O_ch0_tmds_data    (tmds_ch0_data),
+        .O_ch1_tmds_data    (tmds_ch1_data),
+        .O_ch2_tmds_data    (tmds_ch2_data),
+        .O_clk_tmds_data    (tmds_clk_data)
+    );
+
+    hdmi_phy_wrapper #(
+        .DEVICE ("EG")
+    ) u_hdmi_phy (
+        .I_pixel_clk        (video_clk),
+        .I_serial_clk       (hdmi_5x_clk),
+        .I_rst              (rst_all),
+        .I_tmds_channel_0   (tmds_ch0_data),
+        .I_tmds_channel_1   (tmds_ch1_data),
+        .I_tmds_channel_2   (tmds_ch2_data),
+        .I_tmds_channel_clk (tmds_clk_data),
+        .O_tmds_ch0_p       (HDMI_D0_P),
+        .O_tmds_ch1_p       (HDMI_D1_P),
+        .O_tmds_ch2_p       (HDMI_D2_P),
+        .O_tmds_clk_p       (HDMI_CLK_P)
+    );
+
+    //=========================================================== 数码管
+    wire [7:0] seg_d0, seg_d1, seg_d2, seg_d3, seg_d4, seg_d5;
+
+    seg_status u_seg_status (
+        .state_code   (sched_state),
+        .cur_id       (cur_id),
+        .n_img        ((img_count > 16'd8) ? 4'd8 : img_count[3:0]),
+        .auto_en      (auto_en),
+        .emerg_en     (emerg_en),
+        .sd_init_done (sd_init_done),
+        .err_byte     (err_code[7:0] | last_err[7:0]),
+
+        .seg_data_0   (seg_d0),
+        .seg_data_1   (seg_d1),
+        .seg_data_2   (seg_d2),
+        .seg_data_3   (seg_d3),
+        .seg_data_4   (seg_d4),
+        .seg_data_5   (seg_d5)
+    );
+
+    seg_scan u_seg_scan (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .seg_sel    (seg_sel),
+        .seg_data   (seg_data),
+        .seg_data_0 (seg_d0),
+        .seg_data_1 (seg_d1),
+        .seg_data_2 (seg_d2),
+        .seg_data_3 (seg_d3),
+        .seg_data_4 (seg_d4),
+        .seg_data_5 (seg_d5)
+    );
+
+    //=========================================================== 指示灯
+    // 心跳灯直接用 50MHz 输入时钟、不受复位控制：
+    // 只要 FPGA 配置成功、晶振在跑，LED[3] 就一定闪 —— 这是"程序活着"的硬判据。
+    // （原实现挂在 video_clk 上且受 rst_all 复位，video PLL 一出问题灯就不亮，
+    //   上板时会被误判成"程序没烧进去"。【2026-10-12 修正】）
+    reg [23:0] hb_cnt = 24'd0;
+    always @(posedge clk) hb_cnt <= hb_cnt + 24'd1;
+
+    assign led[0] = sd_init_done;    // SD 卡初始化完成
+    assign led[1] = auto_en;         // 自动轮播开着
+    assign led[2] = emerg_en;        // 处于应急模式
+    assign led[3] = hb_cnt[23];      // 心跳，50MHz 下约 0.17 秒翻转一次
+
+endmodule
